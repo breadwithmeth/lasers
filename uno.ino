@@ -583,7 +583,7 @@ void tickScene(){
 void handleLine(const String& ln){
   if (!ln.length()) return;
   String cmd = ln; cmd.trim();
-
+  Serial.print(cmd);
   // Power OFF
   if (cmd.equalsIgnoreCase("OFF")){
     currentScene = SCENE_NONE;
@@ -891,7 +891,7 @@ void setup(){
   DmxSimple.maxChannel(512);
   dmxFill(0);
 
-  bridge.begin(115200);
+  bridge.begin(9600);
   Serial.begin(115200);
 
   Serial.println(F("UNO DMX ready."));
