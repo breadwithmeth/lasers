@@ -17,6 +17,10 @@ const int   POLL_WAIT_SECS = 15;         // сколько сервер держ
 const bool  POLL_TLS_INSECURE = true;    // true = не проверять сертификат (для быстрых тестов)
 const char* AUTH_BEARER = "";            // "Bearer xxx" (оставьте пустым, если не нужно)
 
+// ---- Device status POST (local backend) ----
+// ⚠️ Замените localhost на адрес вашего бэкенда, если он не на ESP!
+const char* STATE_POST_URL = "http://localhost:8080/api/v1/device/laser001/state";
+
 // ---- Device identity ----
 String DEVICE_ID; // формируется из ChipID в setup()
 
@@ -52,6 +56,10 @@ unsigned long g_lastPollOkAt = 0;
 int g_lastHttpCode = 0;
 unsigned long g_nextPollAt = 0;
 int g_backoffMs = 1000; // экспоненциальный откат при ошибках (до 30с)
+
+// ---- POST diag ----
+int g_lastPostCode = 0;
+String g_lastPostResp;
 
 // ---------- UCS2 HEX -> UTF-8 ----------
 static inline bool isHexDigit(char c){
@@ -248,6 +256,7 @@ String htmlHeader(){
 "button{padding:6px 10px;border:1px solid #ccc;border-radius:8px;background:#f6f6f6;cursor:pointer}"
 ".ok{color:#0a0} .err{color:#a00}"
 "a{color:#06c;text-decoration:none} a:hover{text-decoration:underline}"
+"pre{white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:8px;background:#fafafa}"
 "</style></head><body>"
   );
 }
@@ -308,6 +317,14 @@ void handleRoot(){
           "<input type='text' name='num' placeholder='+770XXXXXXXXX' style='width:220px'>"
           "<button type='submit'>Позвонить</button></form>";
   html += "<p><a href=\"/hang\">🛑 Положить трубку</a></p></div>";
+
+  // БлокPOST
+  html += "<div class='card'><h2>Backend POST</h2>";
+  html += "<p>URL: <code>" + String(STATE_POST_URL) + "</code></p>";
+  html += "<p>Last code: <code>" + String(g_lastPostCode) + "</code></p>";
+  html += "<pre>" + (g_lastPostResp.length()? g_lastPostResp : String("-")) + "</pre>";
+  html += "<p>Тест: <a href='/api/state?state=OK&deviation=0'>/api/state?state=OK&deviation=0</a></p>";
+  html += "</div>";
 
   // JS
   html += F(
@@ -492,6 +509,48 @@ void wifiConnectIfNeeded(){
   } else {
     Serial.println("[WiFi] Failed. Will retry in loop.");
   }
+}
+
+// ===================== Device status POST =====================
+bool postDeviceState(const String& state, float deviation){
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[POST] WiFi not connected");
+    return false;
+  }
+  HTTPClient http;
+  WiFiClient client; // http://
+
+  DynamicJsonDocument doc(256);
+  doc["state"] = state;
+  doc["deviation"] = deviation;
+  String body;
+  serializeJson(doc, body);
+
+  Serial.println("[POST] " + String(STATE_POST_URL));
+  Serial.println("[POST] body=" + body);
+
+  http.setReuse(true);
+  http.setTimeout(5000);
+  if (!http.begin(client, STATE_POST_URL)) {
+    Serial.println("[POST] http.begin() failed");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(body);
+  g_lastPostCode = code;
+  bool ok = false;
+  if (code > 0) {
+    g_lastPostResp = http.getString();
+    Serial.printf("[POST] code=%d\n", code);
+    Serial.println("[POST] resp=" + g_lastPostResp);
+    ok = (code >= 200 && code < 300);
+  } else {
+    g_lastPostResp = http.errorToString(code);
+    Serial.printf("[POST] error=%s\n", g_lastPostResp.c_str());
+  }
+  http.end();
+  return ok;
 }
 
 // ===================== Long-poll =====================
@@ -694,6 +753,23 @@ void setup(){
   server.on("/sim/off", HTTP_GET, handleSimOff);
   server.on("/sim/pulse", HTTP_GET, handleSimPulse);
   server.on("/sim/ping", HTTP_GET, handleSimPing);
+
+  // POST state endpoint (ручной триггер/тест)
+  server.on("/api/state", HTTP_GET, [](){
+    String st = server.hasArg("state") ? server.arg("state") : "OK";
+    float dev = server.hasArg("deviation") ? server.arg("deviation").toFloat() : 0.0f;
+    bool ok = postDeviceState(st, dev);
+
+    DynamicJsonDocument resp(1024);
+    resp["ok"] = ok;
+    resp["http_code"] = g_lastPostCode;
+    resp["resp"] = g_lastPostResp;
+    String out;
+    serializeJson(resp, out);
+
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(ok?200:502, "application/json", out);
+  });
 
   server.begin();
   Serial.print("[HTTP] Server on STA IP: "); Serial.println(WiFi.localIP());
