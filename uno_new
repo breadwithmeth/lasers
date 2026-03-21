@@ -1,0 +1,380 @@
+#include <DmxSimple.h>
+
+#define DMX_PIN 3
+#define STEP 10
+#define MAX_LASERS 10
+
+#define ON 255
+#define OFF 0
+
+uint8_t dmxFrame[513];
+
+enum Scene {
+  SCENE_NONE=0,
+  SCENE_1, SCENE_2, SCENE_3, SCENE_4,
+  SCENE_5, SCENE_6, SCENE_7, SCENE_8,
+  SCENE_9, SCENE_10, SCENE_11, SCENE_12,
+  SCENE_13, SCENE_14
+};
+
+Scene currentScene = SCENE_NONE;
+
+uint8_t scenePhase = 0;
+unsigned long lastSceneSwitch = 0;
+
+// параметры сцены
+int activeLaserCount = 10;
+unsigned long sceneDelay = 400; // по умолчанию
+
+// состояния
+int dir4 = 1;
+bool phase9 = false;
+bool phase12 = false;
+
+// ================= UTILS =================
+void allOff() {
+  for (int i = 1; i <= 512; i++) dmxFrame[i] = 0;
+}
+
+void setCh(int ch, int val) {
+  if (ch >= 1 && ch <= 512)
+    dmxFrame[ch] = constrain(val, 0, 255);
+}
+
+void applyFrame() {
+  for (int ch = 1; ch <= 512; ch++)
+    DmxSimple.write(ch, dmxFrame[ch]);
+}
+
+int laserToChannel(int i) {
+  return 10 + i * STEP;
+}
+
+int maxIdx() {
+  return activeLaserCount - 1;
+}
+
+// ================= SCENES =================
+
+// 1 — все
+void runScene1() {
+  allOff();
+  for (int i = 0; i < activeLaserCount; i++)
+    setCh(laserToChannel(i), ON);
+}
+
+// 2 — чет/нечет
+void runScene2() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase ^= 1;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  for (int i = 0; i < activeLaserCount; i++) {
+    if ((scenePhase == 0 && i % 2 == 1) ||
+        (scenePhase == 1 && i % 2 == 0)) {
+      setCh(laserToChannel(i), ON);
+    }
+  }
+}
+
+// 3 — бегущий
+void runScene3() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase = (scenePhase + 1) % activeLaserCount;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+  setCh(laserToChannel(scenePhase), ON);
+}
+
+// 4 — bounce
+void runScene4() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase += dir4;
+
+    if (scenePhase >= maxIdx()) { scenePhase = maxIdx(); dir4 = -1; }
+    if (scenePhase <= 0) { scenePhase = 0; dir4 = 1; }
+
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+  setCh(laserToChannel(scenePhase), ON);
+}
+
+// 5 — fill
+void runScene5() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase++;
+    if (scenePhase >= activeLaserCount) scenePhase = 0;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+  for (int i = 0; i <= scenePhase; i++)
+    setCh(laserToChannel(i), ON);
+}
+
+// 6 — wave
+void runScene6() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase = (scenePhase + 1) % activeLaserCount;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  for (int i = 0; i < 3; i++) {
+    int idx = scenePhase + i;
+    if (idx < activeLaserCount)
+      setCh(laserToChannel(idx), ON);
+  }
+}
+
+// 7 — двойной противоположный
+void runScene7() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase = (scenePhase + 1) % activeLaserCount;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  setCh(laserToChannel(scenePhase), ON);
+  int second = (scenePhase + activeLaserCount / 2) % activeLaserCount;
+  setCh(laserToChannel(second), ON);
+}
+
+// 8 — random
+void runScene8() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase = random(0, activeLaserCount);
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+  setCh(laserToChannel(scenePhase), ON);
+}
+
+// 9 — строб
+void runScene9() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    phase9 = !phase9;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  if (phase9) {
+    for (int i = 0; i < activeLaserCount; i++)
+      setCh(laserToChannel(i), ON);
+  }
+}
+
+// 10 — от центра
+void runScene10() {
+  int centerL = (activeLaserCount - 1) / 2;
+  int centerR = activeLaserCount / 2;
+  int maxStep = activeLaserCount / 2;
+
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase++;
+    if (scenePhase > maxStep) scenePhase = 0;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  int l = centerL - scenePhase;
+  int r = centerR + scenePhase;
+
+  if (l >= 0) setCh(laserToChannel(l), ON);
+  if (r < activeLaserCount) setCh(laserToChannel(r), ON);
+}
+
+// 11 — к центру
+void runScene11() {
+  int maxStep = activeLaserCount / 2;
+
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase++;
+    if (scenePhase > maxStep) scenePhase = 0;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  int l = scenePhase;
+  int r = maxIdx() - scenePhase;
+
+  if (l < activeLaserCount) setCh(laserToChannel(l), ON);
+  if (r >= 0 && r != l) setCh(laserToChannel(r), ON);
+}
+
+// 12 — через один
+void runScene12() {
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    phase12 = !phase12;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  int start = phase12 ? 0 : 1;
+
+  for (int i = start; i < activeLaserCount; i += 2)
+    setCh(laserToChannel(i), ON);
+}
+
+// 13 — двойной L→R
+void runScene13() {
+  if (activeLaserCount < 2) return;
+
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase++;
+    if (scenePhase >= activeLaserCount - 1)
+      scenePhase = 0;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  setCh(laserToChannel(scenePhase), ON);
+  setCh(laserToChannel(scenePhase + 1), ON);
+}
+
+// 14 — двойной R→L
+void runScene14() {
+  if (activeLaserCount < 2) return;
+
+  if (millis() - lastSceneSwitch >= sceneDelay) {
+    scenePhase++;
+    if (scenePhase >= activeLaserCount - 1)
+      scenePhase = 0;
+    lastSceneSwitch = millis();
+  }
+
+  allOff();
+
+  int base = (activeLaserCount - 2) - scenePhase;
+
+  setCh(laserToChannel(base), ON);
+  setCh(laserToChannel(base + 1), ON);
+}
+
+// ================= SWITCH =================
+void updateScenes() {
+  switch(currentScene) {
+    case SCENE_1: runScene1(); break;
+    case SCENE_2: runScene2(); break;
+    case SCENE_3: runScene3(); break;
+    case SCENE_4: runScene4(); break;
+    case SCENE_5: runScene5(); break;
+    case SCENE_6: runScene6(); break;
+    case SCENE_7: runScene7(); break;
+    case SCENE_8: runScene8(); break;
+    case SCENE_9: runScene9(); break;
+    case SCENE_10: runScene10(); break;
+    case SCENE_11: runScene11(); break;
+    case SCENE_12: runScene12(); break;
+    case SCENE_13: runScene13(); break;
+    case SCENE_14: runScene14(); break;
+    default: break;
+  }
+}
+
+// ================= COMMAND =================
+void resetState() {
+  scenePhase = 0;
+  lastSceneSwitch = millis();
+  dir4 = 1;
+}
+
+void handleLine(String cmd) {
+
+  cmd.trim();
+
+  if (cmd == "OFF") {
+    currentScene = SCENE_NONE;
+    allOff();
+    applyFrame();
+    return;
+  }
+
+  // SCENE n count delay(ms)
+  if (cmd.startsWith("SCENE ")) {
+
+    int s = 0, count = 0, delayMs = 0;
+
+    int parsed = sscanf(cmd.c_str(), "SCENE %d %d %d", &s, &count, &delayMs);
+
+    if (s >= 1 && s <= 14) {
+
+      currentScene = (Scene)s;
+
+      if (parsed >= 2)
+        activeLaserCount = constrain(count, 1, MAX_LASERS);
+      else
+        activeLaserCount = MAX_LASERS;
+
+      if (parsed == 3)
+        sceneDelay = constrain(delayMs, 50, 5000);
+
+      resetState();
+
+      Serial.print("SCENE ");
+      Serial.print(s);
+      Serial.print(" ");
+      Serial.print(activeLaserCount);
+      Serial.print(" ");
+      Serial.println(sceneDelay);
+    }
+
+    return;
+  }
+
+  // manual
+  int ch = 0, val = 0;
+
+  if (sscanf(cmd.c_str(), "%d %d", &ch, &val) == 2) {
+    currentScene = SCENE_NONE;
+
+    setCh(ch, val);
+    applyFrame();
+
+    Serial.print("SET ");
+    Serial.print(ch);
+    Serial.print(" ");
+    Serial.println(val);
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  DmxSimple.usePin(DMX_PIN);
+  DmxSimple.maxChannel(512);
+
+  allOff();
+  applyFrame();
+
+  Serial.println("READY");
+  Serial.println("SCENE n count delay(ms)");
+}
+
+// ================= LOOP =================
+void loop() {
+
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    handleLine(cmd);
+  }
+
+  updateScenes();
+  applyFrame();
+}
