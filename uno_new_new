@@ -1,0 +1,325 @@
+#include <SPI.h>
+#include <Ethernet.h>
+#include <DmxSimple.h>
+#include <Wire.h>
+#include <RTClib.h>
+
+// ================= CONFIG =================
+#define DEVICE_NAME "laser-26-035"
+#define DEVICE_SECRET "5c6cc9021ed1152b4b5758b69c2a0cba"
+
+const char* MAC_STR = "02:1A:C3:7F:4B:23";
+byte mac[6];
+
+IPAddress server(213,148,10,233);
+#define SERVER_PORT 3000
+
+#define W5500_CS 10
+#define W5500_RST 9
+
+#define DMX_PIN 3
+#define RS485_DIR 2
+
+// DMX модель
+#define LASER_BASE_CHANNEL 10
+#define LASER_STEP 10
+#define MAX_LASERS 10
+
+EthernetClient client;
+RTC_DS3231 rtc;
+
+// ================= STATE =================
+bool useOfflineMode = false;
+bool offlineNightActive = false;
+
+// ================= SCENE =================
+bool sceneActive = false;
+int sceneType = 0;
+int sceneCount = 0;
+int sceneDelay = 0;
+unsigned long lastDhcpRetry = 0;
+unsigned long lastStepTime = 0;
+bool toggleState = false;
+
+// ================= NETWORK STATE MACHINE =================
+enum NetState {
+  NET_IDLE,
+  NET_CONNECT,
+  NET_SEND,
+  NET_READ
+};
+
+NetState netState = NET_IDLE;
+
+unsigned long lastPoll = 0;
+unsigned long netTimer = 0;
+String responseBuffer = "";
+
+// ================= MAC =================
+void parseMAC(const char* str, byte* mac) {
+  int v[6];
+  sscanf(str, "%x:%x:%x:%x:%x:%x",
+    &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+  for (int i = 0; i < 6; i++) mac[i] = (byte)v[i];
+}
+
+// ================= RESET =================
+void resetW5500() {
+  pinMode(W5500_RST, OUTPUT);
+  digitalWrite(W5500_RST, LOW);
+  delay(200);
+  digitalWrite(W5500_RST, HIGH);
+  delay(800);
+}
+
+// ================= TIME =================
+int getHour() {
+  DateTime now = rtc.now();
+  int h = now.hour();
+  if (h < 0 || h > 23) return 22;
+  return h;
+}
+
+// ================= DMX =================
+void allOff() {
+  sceneActive = false;
+  for (int i = 1; i <= 128; i++) {
+    DmxSimple.write(i, 0);
+  }
+}
+
+// ================= COMMAND =================
+void parseCommand(String line) {
+
+  line.trim();
+
+  Serial.print("[CMD] ");
+  Serial.println(line);
+
+  if (line == "O") {
+    allOff();
+    return;
+  }
+
+  int p1 = line.indexOf('|');
+  if (p1 == -1) return;
+
+  String type = line.substring(0, p1);
+
+  if (type == "S") {
+
+    int p2 = line.indexOf('|', p1 + 1);
+    int p3 = line.indexOf('|', p2 + 1);
+
+    sceneType = line.substring(p1 + 1, p2).toInt();
+    sceneCount = line.substring(p2 + 1, p3).toInt();
+    sceneDelay = line.substring(p3 + 1).toInt();
+
+    sceneActive = true;
+
+    // мгновенный старт
+    lastStepTime = 0;
+    toggleState = false;
+    updateScene();
+
+    Serial.println("[CMD] SCENE APPLIED");
+  }
+}
+
+// ================= OFFLINE =================
+void startOfflineScene() {
+
+  Serial.println("[OFFLINE] APPLY DEFAULT COMMAND");
+
+  parseCommand("S|2|10|1500");
+
+  offlineNightActive = true;
+}
+
+// ================= SCENE =================
+void updateScene() {
+
+  if (!sceneActive) return;
+  if (millis() - lastStepTime < sceneDelay) return;
+
+  lastStepTime = millis();
+
+  int count = sceneCount;
+  if (count > MAX_LASERS) count = MAX_LASERS;
+
+  // ===== СЦЕНА 2 (чёт/нечёт) =====
+  if (sceneType == 2) {
+
+    toggleState = !toggleState;
+
+    for (int i = 0; i < count; i++) {
+
+      int ch = LASER_BASE_CHANNEL + (i * LASER_STEP);
+      bool isEven = (i % 2 == 0);
+
+      int val = toggleState
+        ? (isEven ? 255 : 0)
+        : (isEven ? 0 : 255);
+
+      DmxSimple.write(ch, val);
+    }
+  }
+
+  // ===== СЦЕНА 1 (все ON) =====
+  if (sceneType == 1) {
+
+    for (int i = 0; i < count; i++) {
+      int ch = LASER_BASE_CHANNEL + (i * LASER_STEP);
+      DmxSimple.write(ch, 255);
+    }
+  }
+}
+
+// ================= NETWORK =================
+void processNetwork() {
+
+  switch (netState) {
+
+    case NET_IDLE:
+      if (millis() - lastPoll > 5000) {
+        lastPoll = millis();
+        netState = NET_CONNECT;
+      }
+      break;
+
+    case NET_CONNECT:
+      client.stop();
+
+      if (client.connect(server, SERVER_PORT)) {
+        netState = NET_SEND;
+      } else {
+        useOfflineMode = true;
+        netState = NET_IDLE;
+      }
+      break;
+
+    case NET_SEND:
+      client.println("GET /device-agent/commands/pending HTTP/1.1");
+      client.println("Host: 213.148.10.233");
+
+      client.print("x-device-unique-name: ");
+      client.println(DEVICE_NAME);
+
+      client.print("x-device-secret-key: ");
+      client.println(DEVICE_SECRET);
+
+      client.println("Connection: close");
+      client.println();
+
+      responseBuffer = "";
+      netTimer = millis();
+
+      netState = NET_READ;
+      break;
+
+    case NET_READ:
+
+      while (client.available()) {
+        char c = client.read();
+        responseBuffer += c;
+      }
+
+      if (!client.connected()) {
+
+        client.stop();
+
+        int bodyStart = responseBuffer.indexOf("\r\n\r\n");
+        if (bodyStart != -1) {
+          String body = responseBuffer.substring(bodyStart + 4);
+          parseCommand(body);
+        }
+
+        useOfflineMode = false;
+        netState = NET_IDLE;
+      }
+
+      if (millis() - netTimer > 15000) {
+        client.stop();
+        useOfflineMode = true;
+        netState = NET_IDLE;
+      }
+
+      break;
+  }
+}
+
+
+
+
+void ensureNetwork() {
+
+  // если IP нет → пробуем DHCP
+  if (Ethernet.localIP()[0] == 0) {
+
+    if (millis() - lastDhcpRetry > 5000) {
+
+      lastDhcpRetry = millis();
+
+      Serial.println("[NET] TRY DHCP");
+
+      if (Ethernet.begin(mac) != 0) {
+
+        Serial.print("[NET] GOT IP: ");
+        Serial.println(Ethernet.localIP());
+
+        useOfflineMode = false;
+        offlineNightActive = false;
+
+        netState = NET_IDLE; // перезапуск сети
+      }
+    }
+  }
+}
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(RS485_DIR, OUTPUT);
+  digitalWrite(RS485_DIR, HIGH);
+
+  DmxSimple.usePin(DMX_PIN);
+  DmxSimple.maxChannel(128);
+
+  Wire.begin();
+  rtc.begin();
+
+  parseMAC(MAC_STR, mac);
+
+  resetW5500();
+
+  if (Ethernet.begin(mac) == 0) {
+    useOfflineMode = true;
+  }
+}
+
+// ================= LOOP =================
+void loop() {
+
+  // 🔥 DMX всегда работает без пауз
+  updateScene();
+  ensureNetwork();
+  // 🔥 сеть не блокирует
+  processNetwork();
+
+  // ===== OFFLINE =====
+  if (useOfflineMode) {
+
+    int hour = getHour();
+    bool isNight = (hour >= 19 || hour < 5);
+
+    if (isNight && !offlineNightActive) {
+      startOfflineScene();
+    }
+
+    if (!isNight && offlineNightActive) {
+      allOff();
+      offlineNightActive = false;
+    }
+  }
+}
