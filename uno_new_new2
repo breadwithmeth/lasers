@@ -5,10 +5,10 @@
 #include <RTClib.h>
 
 // ================= CONFIG =================
-#define DEVICE_NAME "laser-26-035"
-#define DEVICE_SECRET "5c6cc9021ed1152b4b5758b69c2a0cba"
+#define DEVICE_NAME "laser-26-037"
+#define DEVICE_SECRET "03218c0cc817ffd5fc032f7096dbf02b"
 
-const char* MAC_STR = "02:1A:C3:7F:4B:23";
+const char* MAC_STR = "02:1A:C3:7F:4B:25";
 byte mac[6];
 
 IPAddress server(213,148,10,233);
