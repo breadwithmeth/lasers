@@ -280,10 +280,13 @@ void processNetwork() {
 unsigned long lastDhcpRetry = 0;
 
 void ensureNetwork() {
+  if (Ethernet.linkStatus() == LinkOFF) {
+    return;
+  }
 
   if (Ethernet.localIP()[0] == 0) {
 
-    if (millis() - lastDhcpRetry > 5000) {
+    if (millis() - lastDhcpRetry > 15000) {
       lastDhcpRetry = millis();
 
       Serial.println("[NET] RETRY DHCP");
@@ -314,13 +317,13 @@ void setup() {
   Wire.setClock(100000); // важно
 
   rtc.begin();
-
+  //rtc.adjust(DateTime(2026, 3, 26, 00, 10, 0));
+  Serial.println(rtc.now().timestamp());
   parseMAC(MAC_STR, mac);
 
   Ethernet.init(W5500_CS);   // 🔥 ОБЯЗАТЕЛЬНО
   resetW5500();
 
-  Serial.println("[NET] DHCP START");
 
   if (Ethernet.begin(mac) == 0) {
     Serial.println("[NET] DHCP FAIL");
