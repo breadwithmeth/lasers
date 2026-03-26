@@ -5,10 +5,10 @@
 #include <RTClib.h>
 
 // ================= CONFIG =================
-#define DEVICE_NAME "laser-26-002"
-#define DEVICE_SECRET "1409260cd00dfc4bad0cc5df2f7d0dcf"
+#define DEVICE_NAME "laser-26-007"
+#define DEVICE_SECRET "14205ad8ed8a058d9a078fe0fea0d0c3"
 
-const char* MAC_STR = "02:1A:C3:7F:4B:02";
+const char* MAC_STR = "02:1A:C3:7F:4B:07";
 byte mac[6];
 
 IPAddress server(213, 148, 10, 233);
@@ -261,6 +261,7 @@ void setup() {
   Wire.setClock(100000);
 
   rtc.begin();
+  //rtc.adjust(DateTime(2026, 3, 26, 02, 30, 0));
   Serial.println(rtc.now().timestamp());
 
   parseMAC(MAC_STR, mac);
