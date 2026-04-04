@@ -3,21 +3,22 @@
 #include <DmxSimple.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <avr/wdt.h>
 
 // ================= CONFIG =================
-#define DEVICE_NAME "laser-26-039"
-#define DEVICE_SECRET "529cb63d9044999ebfc38abcf5545beb"
+#define DEVICE_NAME "laser-26-010"
+#define DEVICE_SECRET "3bbf3b33009cda551452913f23ae6bac"
+#define USE_WDT 0
 
-const char* MAC_STR = "02:1A:C3:7F:4B:27";
+const char* MAC_STR = "02:1A:C3:7F:4B:0A";
 byte mac[6];
 
-// --- STATIC NETWORK (instead of DHCP) ---
-IPAddress localIp(10, 0, 196, 148);       // <-- укажи нужный IP
-IPAddress dnsIp(8, 8, 8, 8);              // <-- укажи ваш DNS (лучше роутер)
-IPAddress gatewayIp(10, 0, 196, 129);     // <-- укажи ваш шлюз
-IPAddress subnetMask(255, 255, 255, 224); // <-- укажи вашу маску
+IPAddress localIp(10, 72, 2, 240);
+IPAddress dnsIp(8, 8, 8, 8);
+IPAddress gatewayIp(10, 72, 2, 193);
+IPAddress subnetMask(255, 255, 255, 224);
 
-const char* serverHost = "nb26.avssr.kz"; // <-- укажи домен сервера
+const char* serverHost = "nb26.avssr.kz";
 #define SERVER_PORT 3000
 
 #define W5500_CS 10
@@ -36,6 +37,7 @@ RTC_DS3231 rtc;
 // ================= STATE =================
 bool useOfflineMode = false;
 bool offlineNightActive = false;
+bool rtcOk = false;
 
 // ================= SCENE =================
 bool sceneActive = false;
@@ -45,34 +47,71 @@ int sceneDelay = 0;
 
 unsigned long lastStepTime = 0;
 bool toggleState = false;
+int sceneRunIndex = 0;
+bool sceneDirForward = true;
+uint8_t pulseLevel = 0;
+bool pulseUp = true;
+uint16_t lfsr = 0xACE1;
 
 // ================= NETWORK =================
-enum NetState {
-  NET_IDLE,
-  NET_CONNECT,
-  NET_SEND,
-  NET_READ
-};
-
+enum NetState { NET_IDLE, NET_CONNECT, NET_SEND, NET_READ };
 NetState netState = NET_IDLE;
 
 unsigned long lastPoll = 0;
 unsigned long netTimer = 0;
 String responseBuffer = "";
 
-// Проверка линка раз в 10 секунд
 unsigned long lastLinkCheck = 0;
-const unsigned long linkCheckInterval = 10000;
+const unsigned long linkCheckInterval = 30000UL;
 bool lastLinkUp = true;
 
-// ================= MAC =================
+const unsigned long pollInterval = 30000UL;
+
+unsigned long lastPingCheck = 0;
+const unsigned long pingCacheTtl = 180000UL;
+bool lastPingResult = false;
+bool pingCacheValid = false;
+
+// NEW: threshold before switching offline
+uint8_t netFailStreak = 0;
+const uint8_t offlineFailThreshold = 3;
+
+// ================= RTC CACHE =================
+unsigned long lastHourReadMs = 0;
+const unsigned long hourCacheTtl = 30000UL;
+int cachedHour = 12;
+
+// ================= DEBUG =================
+unsigned long dbgT = 0;
+
+// ================= WDT =================
+static inline void wdtSetup() {
+#if USE_WDT
+  wdt_disable();
+  wdt_enable(WDTO_8S);
+  wdt_reset();
+#endif
+}
+static inline void wdtFeed() {
+#if USE_WDT
+  wdt_reset();
+#endif
+}
+
+// ================= HELPERS =================
+static inline uint16_t fastRand16() {
+  unsigned lsb = lfsr & 1;
+  lfsr >>= 1;
+  if (lsb) lfsr ^= 0xB400u;
+  return lfsr;
+}
+
 void parseMAC(const char* str, byte* outMac) {
   int v[6];
   sscanf(str, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
   for (byte i = 0; i < 6; i++) outMac[i] = (byte)v[i];
 }
 
-// ================= RESET =================
 void resetW5500() {
   pinMode(W5500_RST, OUTPUT);
   digitalWrite(W5500_RST, LOW);
@@ -81,101 +120,47 @@ void resetW5500() {
   delay(800);
 }
 
-// FIX: статическая конфигурация через begin(mac, ip, dns, gateway, subnet)
 bool applyStaticIP() {
   Ethernet.begin(mac, localIp, dnsIp, gatewayIp, subnetMask);
   delay(300);
-
   return (Ethernet.localIP() == localIp &&
           Ethernet.subnetMask() == subnetMask &&
           Ethernet.gatewayIP() == gatewayIp);
 }
 
-// ================= DIAG =================
 void printNetDiag(const __FlashStringHelper* tag) {
   Serial.println();
-  Serial.print(F("[NET] === "));
-  Serial.print(tag);
-  Serial.println(F(" ==="));
-
-  EthernetHardwareStatus hw = Ethernet.hardwareStatus();
-  Serial.print(F("[NET] HW: "));
-  if (hw == EthernetNoHardware) Serial.println(F("NoHardware"));
-  else if (hw == EthernetW5100) Serial.println(F("W5100"));
-  else if (hw == EthernetW5200) Serial.println(F("W5200"));
-  else if (hw == EthernetW5500) Serial.println(F("W5500"));
-  else Serial.println(F("Unknown"));
-
-  EthernetLinkStatus ls = Ethernet.linkStatus();
-  Serial.print(F("[NET] LINK: "));
-  if (ls == Unknown) Serial.println(F("Unknown"));
-  else if (ls == LinkON) Serial.println(F("ON"));
-  else if (ls == LinkOFF) Serial.println(F("OFF"));
-
-  Serial.print(F("[NET] MAC: "));
-  for (byte i = 0; i < 6; i++) {
-    if (mac[i] < 16) Serial.print('0');
-    Serial.print(mac[i], HEX);
-    if (i < 5) Serial.print(':');
-  }
-  Serial.println();
-
-  Serial.print(F("[NET] IP : "));
-  Serial.println(Ethernet.localIP());
-  Serial.print(F("[NET] SN : "));
-  Serial.println(Ethernet.subnetMask());
-  Serial.print(F("[NET] GW : "));
-  Serial.println(Ethernet.gatewayIP());
-  Serial.print(F("[NET] DNS: "));
-  Serial.println(Ethernet.dnsServerIP());
-
+  Serial.print(F("[NET] === ")); Serial.print(tag); Serial.println(F(" ==="));
+  Serial.print(F("[NET] IP : ")); Serial.println(Ethernet.localIP());
+  Serial.print(F("[NET] SN : ")); Serial.println(Ethernet.subnetMask());
+  Serial.print(F("[NET] GW : ")); Serial.println(Ethernet.gatewayIP());
+  Serial.print(F("[NET] DNS: ")); Serial.println(Ethernet.dnsServerIP());
   Serial.println(F("[NET] ====================="));
 }
 
-void syncRTCFromSerial() {
-  if (!Serial.available()) return;
-
-  String s = Serial.readStringUntil('\n');
-  s.trim();
-
-  int year  = s.substring(0, 4).toInt();
-  int month = s.substring(5, 7).toInt();
-  int day   = s.substring(8, 10).toInt();
-  int hour  = s.substring(11, 13).toInt();
-  int min   = s.substring(14, 16).toInt();
-  int sec   = s.substring(17, 19).toInt();
-
-  rtc.adjust(DateTime(year, month, day, hour, min, sec));
-  Serial.println(F("[RTC] SYNC OK"));
-}
-
-// ================= TIME =================
 int getHour() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastHourReadMs < hourCacheTtl) return cachedHour;
+  lastHourReadMs = nowMs;
+
+  if (!rtcOk) return (cachedHour = 12);
   DateTime now = rtc.now();
-  if (now.year() < 2023) {
-    Serial.println(F("[RTC] INVALID → fallback night"));
-    return 9;
-  }
-  return now.hour();
+  if (now.year() < 2023 || now.year() > 2027) cachedHour = 12;
+  else cachedHour = now.hour();
+  return cachedHour;
 }
 
-// ================= DMX =================
 void allOff() {
   sceneActive = false;
+  sceneRunIndex = 0;
   for (int i = 1; i <= 128; i++) DmxSimple.write(i, 0);
 }
 
-// ================= COMMAND =================
 void parseCommand(String line) {
   line.trim();
+  Serial.print(F("[CMD] ")); Serial.println(line);
 
-  Serial.print(F("[CMD] "));
-  Serial.println(line);
-
-  if (line == "O" || line == "0") {
-    allOff();
-    return;
-  }
+  if (line == "O" || line == "0") { allOff(); return; }
 
   int p1 = line.indexOf('|');
   if (p1 == -1) return;
@@ -185,20 +170,28 @@ void parseCommand(String line) {
 
     int p2 = line.indexOf('|', p1 + 1);
     int p3 = line.indexOf('|', p2 + 1);
+    if (p2 == -1 || p3 == -1) return;
 
     sceneType  = line.substring(p1 + 1, p2).toInt();
     sceneCount = line.substring(p2 + 1, p3).toInt();
     sceneDelay = line.substring(p3 + 1).toInt();
 
+    if (sceneCount < 1) sceneCount = 1;
+    if (sceneCount > MAX_LASERS) sceneCount = MAX_LASERS;
+    if (sceneDelay < 20) sceneDelay = 20;
+
     sceneActive = true;
-    lastStepTime = millis() - sceneDelay;
-    toggleState = true;
+    lastStepTime = 0;
+    toggleState = false;
+    sceneRunIndex = -1;
+    sceneDirForward = true;
+    pulseLevel = 0;
+    pulseUp = true;
 
     Serial.println(F("[CMD] SCENE APPLIED"));
   }
 }
 
-// ================= OFFLINE =================
 void startOfflineScene() {
   Serial.println(F("[OFFLINE] START SCENE 2"));
   parseCommand("S|2|10|1500");
@@ -209,37 +202,181 @@ void startOfflineScene() {
 void updateScene() {
   if (!sceneActive) return;
 
-  int count = (sceneCount > MAX_LASERS) ? MAX_LASERS : sceneCount;
+  int count = sceneCount;
+  if (count < 1) return;
+  if (count > MAX_LASERS) count = MAX_LASERS;
 
   if (sceneType == 1 || sceneType == 99) {
     byte val = (sceneType == 1) ? 255 : 0;
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, val);
+    return;
+  }
+
+  if (millis() - lastStepTime < (unsigned long)sceneDelay) return;
+  lastStepTime = millis();
+
+  if (sceneType == 2) {
+    toggleState = !toggleState;
     for (int i = 0; i < count; i++) {
-      int ch = LASER_BASE_CHANNEL + (i * LASER_STEP);
-      DmxSimple.write(ch, val);
+      bool isEven = !(i & 1);
+      int val = toggleState ? (isEven ? 255 : 0) : (isEven ? 0 : 255);
+      DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, val);
     }
     return;
   }
 
-  if (sceneType == 2) {
-    if (millis() - lastStepTime < (unsigned long)sceneDelay) return;
+  if (sceneType == 3) {
+    sceneRunIndex++;
+    if (sceneRunIndex >= count) sceneRunIndex = 0;
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, (i == sceneRunIndex) ? 255 : 0);
+    return;
+  }
 
-    lastStepTime = millis();
-    toggleState = !toggleState;
+  if (sceneType == 4) {
+    sceneRunIndex++;
+    if (sceneRunIndex >= count) sceneRunIndex = 0;
+    int active = (count - 1) - sceneRunIndex;
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, (i == active) ? 255 : 0);
+    return;
+  }
 
+  if (sceneType == 5) {
+    sceneRunIndex++;
+    if (sceneRunIndex > count) sceneRunIndex = 0;
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, (i < sceneRunIndex) ? 255 : 0);
+    return;
+  }
+
+  if (sceneType == 6) {
+    sceneRunIndex++;
+    if (sceneRunIndex > count) sceneRunIndex = 0;
+    int onFrom = count - sceneRunIndex;
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, (i >= onFrom) ? 255 : 0);
+    return;
+  }
+
+  if (sceneType == 7) {
+    int maxPair = (count + 1) / 2;
+    if (sceneDirForward) {
+      sceneRunIndex++;
+      if (sceneRunIndex >= maxPair) { sceneRunIndex = maxPair - 1; sceneDirForward = false; }
+    } else {
+      sceneRunIndex--;
+      if (sceneRunIndex < 0) { sceneRunIndex = 0; sceneDirForward = true; }
+    }
+
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, 0);
+
+    int a = sceneRunIndex;
+    int b = (count - 1) - sceneRunIndex;
+    DmxSimple.write(LASER_BASE_CHANNEL + a * LASER_STEP, 255);
+    if (b != a) DmxSimple.write(LASER_BASE_CHANNEL + b * LASER_STEP, 255);
+    return;
+  }
+
+  if (sceneType == 8) {
+    sceneRunIndex++;
+    if (sceneRunIndex >= 3) sceneRunIndex = 0;
     for (int i = 0; i < count; i++) {
-      int ch = LASER_BASE_CHANNEL + (i * LASER_STEP);
+      int val = ((i % 3) == sceneRunIndex) ? 255 : 0;
+      DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, val);
+    }
+    return;
+  }
+
+  if (sceneType == 9) {
+    sceneRunIndex++;
+    if (sceneRunIndex >= count) sceneRunIndex = 0;
+    for (int i = 0; i < count; i++) {
+      bool on = (i == sceneRunIndex) || (i == ((sceneRunIndex + 1) % count)) || (i == ((sceneRunIndex + 2) % count));
+      DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, on ? 255 : 0);
+    }
+    return;
+  }
+
+  if (sceneType == 10) {
+    if (sceneDirForward) {
+      sceneRunIndex++;
+      if (sceneRunIndex >= count - 1) { sceneRunIndex = count - 1; sceneDirForward = false; }
+    } else {
+      sceneRunIndex--;
+      if (sceneRunIndex <= 0) { sceneRunIndex = 0; sceneDirForward = true; }
+    }
+
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, (i == sceneRunIndex) ? 255 : 0);
+    return;
+  }
+
+  if (sceneType == 11) {
+    int idx = fastRand16() % count;
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, (i == idx) ? 255 : 0);
+    return;
+  }
+
+  if (sceneType == 12) {
+    int a = fastRand16() % count;
+    int b = fastRand16() % count;
+    int c = fastRand16() % count;
+    for (int i = 0; i < count; i++) {
+      bool on = (i == a) || (i == b) || (i == c);
+      DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, on ? 255 : 0);
+    }
+    return;
+  }
+
+  if (sceneType == 13) {
+    toggleState = !toggleState;
+    for (int i = 0; i < count; i++) {
       bool isEven = !(i & 1);
       int val = toggleState ? (isEven ? 255 : 0) : (isEven ? 0 : 255);
-      DmxSimple.write(ch, val);
+      DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, val);
     }
+    return;
+  }
+
+  if (sceneType == 14) {
+    if (pulseUp) {
+      pulseLevel = (pulseLevel >= 224) ? 255 : (pulseLevel + 32);
+      if (pulseLevel >= 255) pulseUp = false;
+    } else {
+      pulseLevel = (pulseLevel <= 31) ? 0 : (pulseLevel - 32);
+      if (pulseLevel == 0) pulseUp = true;
+    }
+
+    for (int i = 0; i < count; i++) DmxSimple.write(LASER_BASE_CHANNEL + i * LASER_STEP, pulseLevel);
+    return;
   }
 }
 
 // ================= NETWORK =================
+bool pingServerRaw() {
+  EthernetClient pingClient;
+
+  // FIX: successful connect is enough for reachability
+  bool ok = pingClient.connect(serverHost, SERVER_PORT);
+  pingClient.stop();
+  return ok;
+}
+
+bool pingServerCached() {
+  unsigned long now = millis();
+  if (pingCacheValid && (now - lastPingCheck < pingCacheTtl)) return lastPingResult;
+  lastPingResult = pingServerRaw();
+  lastPingCheck = now;
+  pingCacheValid = true;
+  return lastPingResult;
+}
+
+void invalidatePingCache() {
+  pingCacheValid = false;
+  lastPingCheck = 0;
+  lastPingResult = false;
+}
+
 void processNetwork() {
   switch (netState) {
     case NET_IDLE:
-      if (millis() - lastPoll > 5000) {
+      if (millis() - lastPoll > pollInterval) {
         lastPoll = millis();
         netState = NET_CONNECT;
       }
@@ -247,26 +384,38 @@ void processNetwork() {
 
     case NET_CONNECT:
       client.stop();
-      if (client.connect(serverHost, SERVER_PORT)) { // по домену
+
+      if (!pingServerCached()) {
+        netFailStreak++;
+        if (netFailStreak >= offlineFailThreshold) {
+          useOfflineMode = true;
+          int hour = getHour();
+          bool isNight = (hour >= 21 || hour < 5);
+          if (isNight && !offlineNightActive) startOfflineScene();
+        }
+        netState = NET_IDLE;
+        break;
+      }
+
+      if (client.connect(serverHost, SERVER_PORT)) {
         netState = NET_SEND;
       } else {
-        useOfflineMode = true;
+        netFailStreak++;
+        if (netFailStreak >= offlineFailThreshold) {
+          useOfflineMode = true;
+          int hour = getHour();
+          bool isNight = (hour >= 21 || hour < 5);
+          if (isNight && !offlineNightActive) startOfflineScene();
+        }
         netState = NET_IDLE;
-
-        int hour = getHour();
-        bool isNight = (hour >= 21 || hour < 5);
-        if (isNight && !offlineNightActive) startOfflineScene();
       }
       break;
 
     case NET_SEND:
       client.println(F("GET /device-agent/commands/pending HTTP/1.1"));
-      client.print(F("Host: "));
-      client.println(serverHost);
-      client.print(F("x-device-unique-name: "));
-      client.println(F(DEVICE_NAME));
-      client.print(F("x-device-secret-key: "));
-      client.println(F(DEVICE_SECRET));
+      client.print(F("Host: ")); client.println(serverHost);
+      client.print(F("x-device-unique-name: ")); client.println(F(DEVICE_NAME));
+      client.print(F("x-device-secret-key: ")); client.println(F(DEVICE_SECRET));
       client.println(F("Connection: close"));
       client.println();
 
@@ -285,12 +434,16 @@ void processNetwork() {
           String body = responseBuffer.substring(bodyStart + 4);
           if (body.length() > 0) {
             parseCommand(body);
-            useOfflineMode = false;
+            useOfflineMode = false;   // success -> online
+            netFailStreak = 0;        // reset fail streak
           } else {
-            useOfflineMode = true;
+            // empty body is still successful request
+            useOfflineMode = false;
+            netFailStreak = 0;
           }
         } else {
-          useOfflineMode = true;
+          netFailStreak++;
+          if (netFailStreak >= offlineFailThreshold) useOfflineMode = true;
         }
 
         responseBuffer = "";
@@ -300,7 +453,8 @@ void processNetwork() {
 
       if (millis() - netTimer > 15000) {
         client.stop();
-        useOfflineMode = true;
+        netFailStreak++;
+        if (netFailStreak >= offlineFailThreshold) useOfflineMode = true;
         responseBuffer = "";
         netTimer = 0;
         netState = NET_IDLE;
@@ -324,6 +478,8 @@ void ensureNetwork() {
     netTimer = 0;
     netState = NET_IDLE;
     lastLinkUp = false;
+    invalidatePingCache();
+    netFailStreak = offlineFailThreshold;
     return;
   }
 
@@ -336,19 +492,20 @@ void ensureNetwork() {
       netTimer = 0;
       netState = NET_IDLE;
       lastPoll = 0;
+      invalidatePingCache();
+      netFailStreak = 0;
     } else {
       printNetDiag(F("RELINK FAIL"));
       useOfflineMode = true;
       responseBuffer = "";
       netTimer = 0;
       netState = NET_IDLE;
+      invalidatePingCache();
+      netFailStreak = offlineFailThreshold;
     }
   }
 
-  if (linkUp && useOfflineMode) {
-    netState = NET_IDLE;
-  }
-
+  if (linkUp && useOfflineMode) netState = NET_IDLE;
   lastLinkUp = true;
 }
 
@@ -365,9 +522,11 @@ void setup() {
   Wire.begin();
   Wire.setClock(100000);
 
-  rtc.begin();
-  //rtc.adjust(DateTime(2026, 3, 28, 12, 43, 0));
-  Serial.println(rtc.now().timestamp());
+  rtcOk = rtc.begin();
+  if (!rtcOk) Serial.println(F("[RTC] DS3231 NOT FOUND -> DISABLED"));
+  else Serial.println(rtc.now().timestamp());
+    //rtc.adjust(DateTime(2026, 3, 28, 12, 43, 0));
+
   Serial.println(F(DEVICE_NAME));
   parseMAC(MAC_STR, mac);
 
@@ -378,10 +537,7 @@ void setup() {
 
   bool ok = false;
   for (byte i = 0; i < 3; i++) {
-    if (applyStaticIP()) {
-      ok = true;
-      break;
-    }
+    if (applyStaticIP()) { ok = true; break; }
     delay(200);
   }
 
@@ -392,17 +548,24 @@ void setup() {
     Serial.print(F("[NET] GOT IP: "));
     Serial.println(Ethernet.localIP());
     useOfflineMode = true;
+    netFailStreak = offlineFailThreshold;
   } else {
     Serial.print(F("[NET] IP: "));
     Serial.println(Ethernet.localIP());
+    netFailStreak = 0;
   }
 
   lastLinkUp = (Ethernet.linkStatus() != LinkOFF);
+  invalidatePingCache();
+  lastHourReadMs = 0;
+  cachedHour = 12;
+
+  wdtSetup();
+  wdtFeed();
 }
 
 // ================= LOOP =================
 void loop() {
-  //syncRTCFromSerial();
   ensureNetwork();
   updateScene();
   processNetwork();
@@ -412,10 +575,21 @@ void loop() {
     bool isNight = (hour >= 21 || hour < 5);
 
     if (isNight && !offlineNightActive) startOfflineScene();
-
     if (!isNight && offlineNightActive) {
       allOff();
       offlineNightActive = false;
     }
   }
+
+  if (millis() - dbgT > 10000UL) {
+    dbgT = millis();
+    Serial.print(F("[HEALTH] link="));
+    Serial.print(Ethernet.linkStatus() == LinkOFF ? F("OFF") : F("ON"));
+    Serial.print(F(" offline="));
+    Serial.print(useOfflineMode ? F("1") : F("0"));
+    Serial.print(F(" failStreak="));
+    Serial.println(netFailStreak);
+  }
+
+  wdtFeed();
 }
