@@ -6,16 +6,16 @@
 #include <avr/wdt.h>
 
 // ================= CONFIG =================
-#define DEVICE_NAME "laser-26-010"
-#define DEVICE_SECRET "3bbf3b33009cda551452913f23ae6bac"
+#define DEVICE_NAME "laser-26-027"
+#define DEVICE_SECRET "6082765b0a95e1793456054a8b2d10c0"
 #define USE_WDT 0
 
-const char* MAC_STR = "02:1A:C3:7F:4B:0A";
+const char* MAC_STR = "02:1A:C3:7F:4B:1B";
 byte mac[6];
 
-IPAddress localIp(10, 72, 2, 240);
+IPAddress localIp(10, 0, 192, 212);
 IPAddress dnsIp(8, 8, 8, 8);
-IPAddress gatewayIp(10, 72, 2, 193);
+IPAddress gatewayIp(10, 0, 192, 193);
 IPAddress subnetMask(255, 255, 255, 224);
 
 const char* serverHost = "nb26.avssr.kz";
