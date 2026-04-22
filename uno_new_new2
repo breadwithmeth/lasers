@@ -2,21 +2,20 @@
 #include <Ethernet.h>
 #include <DmxSimple.h>
 #include <Wire.h>
-#include <RTClib.h>
 #include <avr/wdt.h>
 
 // ================= CONFIG =================
-#define DEVICE_NAME "laser-26-027"
-#define DEVICE_SECRET "6082765b0a95e1793456054a8b2d10c0"
+#define DEVICE_NAME "laser-26-991"
+#define DEVICE_SECRET "c6e8150b18abc2b0c34d1f11efbd26b0"
 #define USE_WDT 0
 
-const char* MAC_STR = "02:1A:C3:7F:4B:1B";
+const char* MAC_STR = "02:1A:C3:7F:4B:0D";
 byte mac[6];
 
-IPAddress localIp(10, 0, 192, 212);
+IPAddress localIp(192, 168, 0, 110);
 IPAddress dnsIp(8, 8, 8, 8);
-IPAddress gatewayIp(10, 0, 192, 193);
-IPAddress subnetMask(255, 255, 255, 224);
+IPAddress gatewayIp(10, 72, 2, 65);
+IPAddress subnetMask(255, 255, 255, 192);
 
 const char* serverHost = "nb26.avssr.kz";
 #define SERVER_PORT 3000
@@ -31,13 +30,17 @@ const char* serverHost = "nb26.avssr.kz";
 #define LASER_STEP 10
 #define MAX_LASERS 10
 
+// 10 minutes before offline scene 99 kicks in
+#define OFFLINE_TIMEOUT_MS 600000UL
+
 EthernetClient client;
-RTC_DS3231 rtc;
 
 // ================= STATE =================
 bool useOfflineMode = false;
-bool offlineNightActive = false;
-bool rtcOk = false;
+bool offlineSceneActive = false;
+
+// Timestamp when we first went offline (0 = not offline)
+unsigned long offlineStartMs = 0;
 
 // ================= SCENE =================
 bool sceneActive = false;
@@ -71,15 +74,6 @@ unsigned long lastPingCheck = 0;
 const unsigned long pingCacheTtl = 180000UL;
 bool lastPingResult = false;
 bool pingCacheValid = false;
-
-// NEW: threshold before switching offline
-uint8_t netFailStreak = 0;
-const uint8_t offlineFailThreshold = 3;
-
-// ================= RTC CACHE =================
-unsigned long lastHourReadMs = 0;
-const unsigned long hourCacheTtl = 30000UL;
-int cachedHour = 12;
 
 // ================= DEBUG =================
 unsigned long dbgT = 0;
@@ -138,18 +132,6 @@ void printNetDiag(const __FlashStringHelper* tag) {
   Serial.println(F("[NET] ====================="));
 }
 
-int getHour() {
-  unsigned long nowMs = millis();
-  if (nowMs - lastHourReadMs < hourCacheTtl) return cachedHour;
-  lastHourReadMs = nowMs;
-
-  if (!rtcOk) return (cachedHour = 12);
-  DateTime now = rtc.now();
-  if (now.year() < 2023 || now.year() > 2027) cachedHour = 12;
-  else cachedHour = now.hour();
-  return cachedHour;
-}
-
 void allOff() {
   sceneActive = false;
   sceneRunIndex = 0;
@@ -193,9 +175,9 @@ void parseCommand(String line) {
 }
 
 void startOfflineScene() {
-  Serial.println(F("[OFFLINE] START SCENE 2"));
-  parseCommand("S|2|10|1500");
-  offlineNightActive = true;
+  Serial.println(F("[OFFLINE] START SCENE 99"));
+  parseCommand("S|99|10|1500");
+  offlineSceneActive = true;
 }
 
 // ================= SCENE =================
@@ -351,8 +333,6 @@ void updateScene() {
 // ================= NETWORK =================
 bool pingServerRaw() {
   EthernetClient pingClient;
-
-  // FIX: successful connect is enough for reachability
   bool ok = pingClient.connect(serverHost, SERVER_PORT);
   pingClient.stop();
   return ok;
@@ -373,6 +353,22 @@ void invalidatePingCache() {
   lastPingResult = false;
 }
 
+// Mark the moment we first lost connectivity (idempotent)
+void markOffline() {
+  if (!useOfflineMode) {
+    useOfflineMode = true;
+    offlineStartMs = millis();
+    offlineSceneActive = false;
+  }
+}
+
+// Call on every successful response to clear offline state
+void markOnline() {
+  useOfflineMode = false;
+  offlineSceneActive = false;
+  offlineStartMs = 0;
+}
+
 void processNetwork() {
   switch (netState) {
     case NET_IDLE:
@@ -386,13 +382,7 @@ void processNetwork() {
       client.stop();
 
       if (!pingServerCached()) {
-        netFailStreak++;
-        if (netFailStreak >= offlineFailThreshold) {
-          useOfflineMode = true;
-          int hour = getHour();
-          bool isNight = (hour >= 21 || hour < 5);
-          if (isNight && !offlineNightActive) startOfflineScene();
-        }
+        markOffline();
         netState = NET_IDLE;
         break;
       }
@@ -400,13 +390,7 @@ void processNetwork() {
       if (client.connect(serverHost, SERVER_PORT)) {
         netState = NET_SEND;
       } else {
-        netFailStreak++;
-        if (netFailStreak >= offlineFailThreshold) {
-          useOfflineMode = true;
-          int hour = getHour();
-          bool isNight = (hour >= 21 || hour < 5);
-          if (isNight && !offlineNightActive) startOfflineScene();
-        }
+        markOffline();
         netState = NET_IDLE;
       }
       break;
@@ -432,18 +416,11 @@ void processNetwork() {
         int bodyStart = responseBuffer.indexOf("\r\n\r\n");
         if (bodyStart != -1) {
           String body = responseBuffer.substring(bodyStart + 4);
-          if (body.length() > 0) {
-            parseCommand(body);
-            useOfflineMode = false;   // success -> online
-            netFailStreak = 0;        // reset fail streak
-          } else {
-            // empty body is still successful request
-            useOfflineMode = false;
-            netFailStreak = 0;
-          }
+          // empty body is still a successful request
+          if (body.length() > 0) parseCommand(body);
+          markOnline();
         } else {
-          netFailStreak++;
-          if (netFailStreak >= offlineFailThreshold) useOfflineMode = true;
+          markOffline();
         }
 
         responseBuffer = "";
@@ -453,8 +430,7 @@ void processNetwork() {
 
       if (millis() - netTimer > 15000) {
         client.stop();
-        netFailStreak++;
-        if (netFailStreak >= offlineFailThreshold) useOfflineMode = true;
+        markOffline();
         responseBuffer = "";
         netTimer = 0;
         netState = NET_IDLE;
@@ -472,14 +448,13 @@ void ensureNetwork() {
   if (!linkUp) {
     client.stop();
     allOff();
-    offlineNightActive = false;
-    useOfflineMode = true;
+    offlineSceneActive = false;
     responseBuffer = "";
     netTimer = 0;
     netState = NET_IDLE;
     lastLinkUp = false;
     invalidatePingCache();
-    netFailStreak = offlineFailThreshold;
+    markOffline();
     return;
   }
 
@@ -487,21 +462,19 @@ void ensureNetwork() {
     client.stop();
     if (applyStaticIP()) {
       printNetDiag(F("RELINK OK"));
-      useOfflineMode = false;
+      markOnline();
       responseBuffer = "";
       netTimer = 0;
       netState = NET_IDLE;
       lastPoll = 0;
       invalidatePingCache();
-      netFailStreak = 0;
     } else {
       printNetDiag(F("RELINK FAIL"));
-      useOfflineMode = true;
       responseBuffer = "";
       netTimer = 0;
       netState = NET_IDLE;
       invalidatePingCache();
-      netFailStreak = offlineFailThreshold;
+      markOffline();
     }
   }
 
@@ -518,14 +491,7 @@ void setup() {
 
   DmxSimple.usePin(DMX_PIN);
   DmxSimple.maxChannel(128);
-
-  Wire.begin();
-  Wire.setClock(100000);
-
-  rtcOk = rtc.begin();
-  if (!rtcOk) Serial.println(F("[RTC] DS3231 NOT FOUND -> DISABLED"));
-  else Serial.println(rtc.now().timestamp());
-    //rtc.adjust(DateTime(2026, 3, 28, 12, 43, 0));
+  DmxSimple.write(1, 255);
 
   Serial.println(F(DEVICE_NAME));
   parseMAC(MAC_STR, mac);
@@ -547,18 +513,14 @@ void setup() {
     Serial.println(F("[NET] STATIC CONFIG FAIL"));
     Serial.print(F("[NET] GOT IP: "));
     Serial.println(Ethernet.localIP());
-    useOfflineMode = true;
-    netFailStreak = offlineFailThreshold;
+    markOffline();
   } else {
     Serial.print(F("[NET] IP: "));
     Serial.println(Ethernet.localIP());
-    netFailStreak = 0;
   }
 
   lastLinkUp = (Ethernet.linkStatus() != LinkOFF);
   invalidatePingCache();
-  lastHourReadMs = 0;
-  cachedHour = 12;
 
   wdtSetup();
   wdtFeed();
@@ -570,15 +532,17 @@ void loop() {
   updateScene();
   processNetwork();
 
-  if (useOfflineMode) {
-    int hour = getHour();
-    bool isNight = (hour >= 21 || hour < 5);
-
-    if (isNight && !offlineNightActive) startOfflineScene();
-    if (!isNight && offlineNightActive) {
-      allOff();
-      offlineNightActive = false;
+  // Offline scene 99: trigger after 10 minutes of continuous offline
+  if (useOfflineMode && !offlineSceneActive) {
+    if (millis() - offlineStartMs >= OFFLINE_TIMEOUT_MS) {
+      startOfflineScene();
     }
+  }
+
+  // If we came back online, cancel the offline scene
+  if (!useOfflineMode && offlineSceneActive) {
+    allOff();
+    offlineSceneActive = false;
   }
 
   if (millis() - dbgT > 10000UL) {
@@ -587,8 +551,8 @@ void loop() {
     Serial.print(Ethernet.linkStatus() == LinkOFF ? F("OFF") : F("ON"));
     Serial.print(F(" offline="));
     Serial.print(useOfflineMode ? F("1") : F("0"));
-    Serial.print(F(" failStreak="));
-    Serial.println(netFailStreak);
+    Serial.print(F(" offlineSec="));
+    Serial.println(useOfflineMode ? (millis() - offlineStartMs) / 1000UL : 0UL);
   }
 
   wdtFeed();
